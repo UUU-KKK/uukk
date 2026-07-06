@@ -3,45 +3,6 @@
 基于 F1 圈级数据预测车手下一圈是否进站（二分类，AUC 评估）。仓库里只有一个主程序 `v-8.1.py`，集成 LightGBM、XGBoost、CatBoost 和一个 PyTorch 残差网络，最后用权重优化 + 堆叠融合输出。GPU/CPU 自适应，单文件可跑通。
 
 
-## 仓库内容
-
-| 文件 | 说明 |
-|---|---|
-| `v-8.1.py` | 主程序，单文件闭环 |
-| `test.csv` | 测试集 |
-| `sample_submission.csv` | 提交样例 |
-| `submission_v8_gpu.csv` | 运行后生成的提交文件 |
-
-数据需放在 `playground-series-s6e5/` 目录下（与代码同级），包含 `train.csv`、`test.csv`、`sample_submission.csv`。代码启动时会打印训练/测试集形状，方便核对数据完整性。
-
-## 快速开始
-
-```bash
-# 1. 安装依赖
-pip install pandas numpy scikit-learn lightgbm xgboost catboost torch scipy
-
-# 2. 准备数据（从 Kaggle 下载）
-#    playground-series-s6e5/
-#    ├── train.csv
-#    ├── test.csv
-#    └── sample_submission.csv
-
-# 3. 运行
-python v-8.1.py
-```
-
-跑完会在当前目录生成 `submission_v8_gpu.csv`，可直接上传 Kaggle。无 GPU 时自动降级到 CPU，无需改代码。
-
-## 环境要求
-
-| 项目 | 要求 |
-|---|---|
-| Python | 3.8+ |
-| GPU（可选） | NVIDIA CUDA 11.x 及以上 |
-| 显存建议 | 6 GB 以上 |
-
-主要依赖：`pandas`、`numpy`、`scikit-learn`、`lightgbm`、`xgboost`、`catboost`、`torch`、`scipy`。其中 PyTorch 的 CUDA 版本需要和本地 CUDA 对应。LightGBM 4.0+ 已把 `device='gpu'` 改为 `device='cuda'`，代码里做了兼容判断。
-
 ## 数据集
 
 | 项目 | 说明 |
@@ -353,57 +314,4 @@ NN 单模 AUC 通常比树模型低 0.005 左右，但加进集成后仍有 0.00
 | n_features | 使用特征数 |
 | elapsed_s | 总耗时（秒） |
 
-## 常见问题
 
-### 运行报错
-
-**eg. `FileNotFoundError: No such file or directory: 'train.csv'`**
-数据路径不对。把数据放进 `playground-series-s6e5/` 目录，或修改代码中的路径。
-
-**eg. `ValueError: Expected 2D array, got 1D array instead`**
-堆叠部分的循环变量名和全局 `oof_stack` 重名，二维矩阵被一维数组覆盖。检查变量命名。
-
-**eg. GPU 没识别，跑在 CPU 上**
-CUDA 环境没配好，或装的是 CPU 版 PyTorch。装对应 CUDA 版本的 PyTorch，确认 `torch.cuda.is_available()` 返回 True。LightGBM 4.0+ 的 GPU 参数从 `device='gpu'` 改成了 `device='cuda'`，注意版本差异。
-
-### 效果调优
-
-**eg. 线下 AUC 高，线上分数低**
-大概率是数据泄露或过拟合。检查目标编码、时序特征有没有泄露，验证折划分是否合理，适当加大正则。
-
-**eg.模型间相关性都很高，集成增益小**
-增加差异化模型，拉开参数差异，或新增特征工程维度引入新信息源。
-
-**eg. 神经网络明显弱于树模型**
-正常。表格数据树模型通常是基线最优，NN 的价值在提供差异化预测，不是单模精度。
-
-## 调参方向
-
-### 全局超参
-
-| 参数 | 默认 | 调整建议 |
-|---|---|---|
-| SEEDS | 5 个种子 | 增加种子提升稳定性，但耗时线性增长 |
-| NF | 5 折 | 折数多偏差小，方差大；折数少反之 |
-| gm | 0.1990 | 取训练集标签均值即可，不要手调 |
-
-### 树模型
-
-- **过拟合**：降 `num_leaves` / `max_depth`，提 `min_data_in_leaf`，加 L1/L2
-- **欠拟合**：提 `n_estimators`，降 `learning_rate`，提 `feature_fraction`
-- **训练慢**：降 `n_estimators`、提 `learning_rate`，或减少种子数
-
-### 神经网络
-
-- **不收敛**：降学习率，检查标签是否正确，标准化是否只在训练折拟合
-- **过拟合**：加 Dropout，减层，加权重衰减
-- **欠拟合**：加层、加宽，降 Dropout
-
-### 集成
-
-- **增益不明显**：检查模型相关性，相关性太高就换差异化更大的模型
-- **线上线下差大**：堆叠元模型用更强正则，或退回简单平均
-
-## License
-
-仅用于学习和 Kaggle 比赛提交。
