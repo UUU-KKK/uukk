@@ -1,164 +1,409 @@
 # F1 进站预测 — Kaggle Playground S6E5
 
-Kaggle Playground Series S6E5 的二分类任务,拿 F1 圈级数据预测车手下一圈是否进站,评测指标 ROC-AUC,目标 LB > 0.954。主文件 `v-8.1.py`,单文件闭环:特征工程 → 6 模型交叉验证 → 权重优化 + 二层堆叠 → 输出提交。LightGBM / XGBoost / CatBoost / PyTorch 残差网络一起上,GPU/CPU 自适应。
+基于 F1 圈级数据预测车手下一圈是否进站（二分类，AUC 评估）。仓库里只有一个主程序 `v-8.1.py`，集成 LightGBM、XGBoost、CatBoost 和一个 PyTorch 残差网络，最后用权重优化 + 堆叠融合输出。GPU/CPU 自适应，单文件可跑通。
 
-## 怎么跑
 
-```bash   ”“bash
+## 仓库内容
+
+| 文件 | 说明 |
+|---|---|
+| `v-8.1.py` | 主程序，单文件闭环 |
+| `test.csv` | 测试集 |
+| `sample_submission.csv` | 提交样例 |
+| `submission_v8_gpu.csv` | 运行后生成的提交文件 |
+
+数据需放在 `playground-series-s6e5/` 目录下（与代码同级），包含 `train.csv`、`test.csv`、`sample_submission.csv`。代码启动时会打印训练/测试集形状，方便核对数据完整性。
+
+## 快速开始
+
+```bash
+# 1. 安装依赖
 pip install pandas numpy scikit-learn lightgbm xgboost catboost torch scipy
 
-# 数据放这里
-# playground-series-s6e5/
-# ├── train.csv
-# ├── test.csv
-# └── sample_submission.csv
+# 2. 准备数据（从 Kaggle 下载）
+#    playground-series-s6e5/
+#    ├── train.csv
+#    ├── test.csv
+#    └── sample_submission.csv
 
+# 3. 运行
 python v-8.1.py
 ```
 
-跑完生成 `submission_v8_gpu.csv`,直接传 Kaggle。无 GPU 自动降级 CPU。
+跑完会在当前目录生成 `submission_v8_gpu.csv`，可直接上传 Kaggle。无 GPU 时自动降级到 CPU，无需改代码。
 
-环境:Python 3.8+,CUDA 11.x+,显存 6 GB+。LightGBM 4.0+ 的 GPU 参数从 `device='gpu'` 改成了 `device='cuda'`,代码已兼容。CPU 跑 5 折 × 5 种子 × 6 模型较慢。
+## 环境要求
 
-## 数据
+| 项目 | 要求 |
+|---|---|
+| Python | 3.8+ |
+| GPU（可选） | NVIDIA CUDA 11.x 及以上 |
+| 显存建议 | 6 GB 以上 |
 
-Kaggle Playground Series S6E5,圈级数据,目标列 `PitNextLap`(0/1),正负比约 1:5,全局先验 `gm = 0.1990`。数据放 `playground-series-s6e5/` 下,与代码同级。
+主要依赖：`pandas`、`numpy`、`scikit-learn`、`lightgbm`、`xgboost`、`catboost`、`torch`、`scipy`。其中 PyTorch 的 CUDA 版本需要和本地 CUDA 对应。LightGBM 4.0+ 已把 `device='gpu'` 改为 `device='cuda'`，代码里做了兼容判断。
 
-## 项目结构
+## 数据集
+
+| 项目 | 说明 |
+|---|---|
+| 来源 | Kaggle Playground Series S6E5 |
+| 训练集 | `train.csv`，圈级数据 |
+| 测试集 | `test.csv` |
+| 目标列 | `PitNextLap`（0/1，下一圈是否进站） |
+| 正负样本比 | 约 1:5（全局先验 `gm = 0.1990`） |
+
+## 代码结构
+
+单文件线性 pipeline，自上而下分 7 个模块，单向依赖、无循环。
+
+| 模块 | 范围 | 职责 |
+|---|---|---|
+| 1 依赖与工具 | 文件开头 ~ `log` 函数 | 导入依赖、屏蔽警告、日志函数 |
+| 2 深度学习组件 | `F1Dataset` ~ `predict_nn` | 数据集类、残差网络、单折训练、批量预测 |
+| 3 全局配置 | 全局常量 ~ GPU 检测 | 超参数、设备自适应 |
+| 4 数据与特征 | 数据加载 ~ 频率编码 | 特征衍生、分组统计、目标编码 |
+| 5 特征筛选 | `FEATURES` 列表 ~ 矩阵输出 | 特征管理、去冗余 |
+| 6 多模型训练 | 多模型训练 ~ NN 训练结束 | 5 折 × 5 种子交叉验证 |
+| 7 集成输出 | 集成优化 ~ 文件结束 | 融合、堆叠、提交文件 |
+
+执行时按 6 个阶段顺序走，每阶段有日志标记：
 
 ```
-.
-├── v-8.1.py                      # 主程序
-├── playground-series-s6e5/       # 数据
-│   ├── train.csv
-│   ├── test.csv
-│   └── sample_submission.csv
-├── submission_v8_gpu.csv         # 提交文件
-├── experiment_v8_gpu.json        # 实验记录
-├── oof_*.npy                     # 各模型 OOF 预测(6 个)
-└── test_*.npy                    # 各模型测试集预测(6 个)
+[1/6] Loading data          数据加载
+[2/6] Feature engineering   特征工程
+[3/6] KFold target encoding 特征编码
+[4/6] Multi-config training 多模型训练
+[5/6] Ensemble optimization 集成优化
+[6/6] Final submission      结果输出
 ```
-
-## 代码组织
-
-单文件线性 pipeline,7 个模块单向依赖:
-
-1. 依赖与工具(文件开头 ~ `log`)
-2. 深度学习组件(`F1Dataset` ~ `predict_nn`)
-3. 全局配置(全局常量 ~ GPU 检测)
-4. 数据与特征(数据加载 ~ 频率编码)
-5. 特征筛选(`FEATURES` ~ 矩阵输出)
-6. 多模型训练(5 折 × 5 种子 CV)
-7. 集成输出(融合、堆叠、提交)
-
-执行阶段日志:`[1/6] Loading data` → `[2/6] Feature engineering` → `[3/6] KFold target encoding` → `[4/6] Multi-config training` → `[5/6] Ensemble optimization` → `[6/6] Final submission`。
 
 ## 特征工程
 
-`add_features` 把原始十来维扩到 100+ 维。
+原始数据只有十余维基础特征，经 `add_features` 扩展到 100+ 维。下面按类别说明。
 
-**轮胎配方交互**:Compound 有序编码 × TyreLife / LapNumber / RaceProgress / Degradation / Position。
+### 轮胎配方交互
 
-**轮胎寿命非线性变换**:`TL_sq`、`TL_cu`、`TL_sqrt`、`TL_log`、`TL_gt_15`、`TL_gt_25`、`TL_gt_35`、`TL_gt_50`。
+把轮胎配方（软/中/硬等）的有序编码和轮胎寿命、圈数、比赛进度、退化、位置做乘法交叉。不同配方衰减曲线和进站策略差别很大，交叉特征让模型区分"同样的轮胎寿命对不同配方意味着什么"。
 
-**退化衍生**:`Deg_per_lap`、`LTD_per_lap`、`Deg_abs`、`Deg_sq`。
+### 轮胎寿命非线性变换
 
-**位置与排名**:`Pos_sq`、`Is_Top10`。
+- 幂次：`TL_sq`、`TL_cu`
+- 平滑：`TL_sqrt`、`TL_log`
+- 阈值二值：`TL_gt_15`、`TL_gt_25`、`TL_gt_35`、`TL_gt_50`
 
-**比赛进度与停站交叉**:`Stint_x_TL`、`PitStop_x_TL`、`Stint_x_RP`、`TL_div_RP`。
+轮胎寿命和进站概率不是线性关系，某个拐点之后概率陡升。树模型本身能学非线性，但显式给出这些变换可以降低学习难度。
 
-**时序滑动窗口**:按 (Race, Driver) 分组,前 3 圈 rolling mean + shift(1),只用历史圈防泄露。窗口试过 5 圈会稀释信号,3 圈最优。
+### 退化衍生
 
-**轮胎配方基准偏差**:配方典型寿命 SOFT 12 / MEDIUM 18 / HARD 25 / INTERMEDIATE 10 / WET 8,生成 `Dev_compound_TL`、`TL_ratio_compound`。
+- `Deg_per_lap`：单圈退化率
+- `LTD_per_lap`：单圈圈速差
+- `Deg_abs`、`Deg_sq`
 
-**分组统计与偏差**:Driver / Race / Compound 三维分组均值 + 当前值偏差。
+单位圈的退化量比累计退化更能反映轮胎当前状态。
 
-**5 折交叉目标编码**:12 组(Driver、Race、Compound、Stint、Year 单特征 5 组;双特征 6 组;三特征 1 组)。折内统计,测试集用全量映射。带先验平滑:
+### 位置与排名
+
+`Pos_sq`、`Is_Top10`。前十和后段车手的进站策略差异显著，二值标记用来强化这个分区。
+
+### 比赛进度与停站交叉
+
+`Stint_x_TL`、`PitStop_x_TL`、`Stint_x_RP`、`TL_div_RP`。同样是轮胎寿命 20 圈，比赛初期和末期含义完全不同，这组交叉刻画"轮胎寿命的相对价值"。
+
+### 时序滑动窗口
+
+按"比赛 + 车手"分组，滚动算前 3 圈的圈速均值、退化均值、圈速变化均值，并做 1 步偏移，只用历史圈，不引入当前圈。
+
+窗口取 3 圈效果最好。试过 5 圈，信号被稀释——单圈圈速标准差大约是均值的 8%，窗口太长会把临近进站的突变抹平。
+
+### 轮胎配方基准偏差
+
+基于业务先验设定每种配方的典型寿命（软胎 12 圈、中性胎 18 圈、硬胎 25 圈等），算当前轮胎寿命偏离基准的程度（`Dev_compound_TL`、`TL_ratio_compound`），直接对应"轮胎是否该换了"。
+
+### 分组统计与偏差
+
+从车手、比赛、轮胎配方三个维度算分组均值，再生成"当前值 - 分组均值"的偏差特征。消除个体基准差异——同样是轮胎寿命 20 圈，对长距离保胎型车手和频繁进站型车手含义不同。
+
+### 5 折交叉目标编码
+
+共 12 组编码：单特征 5 组（Driver、Race、Compound、Stint、Year），双特征 6 组，三特征 1 组。
+
+防泄露做法：
+
+1. 训练集分 5 折
+2. 每折验证集的编码只由其余 4 折的统计量算出
+3. 测试集用全量训练集统计量直接映射
+
+带全局先验平滑：
 
 ```
-smooth = (mean × count + gm × α) / (count + α)平滑度=（均值&次数；统计gm &次数；α） /（统计&alpha；）
+平滑后均值 = (类别均值 × 样本数 + gm × 平滑系数) / (样本数 + 平滑系数)
 ```
 
-单特征 α=100,组合特征 α=30。
+单特征平滑系数 100，组合特征 30。样本量越小，平滑力度越大，避免低频类别编码出现极端值。`gm = 0.1990` 取自训练集标签均值。
 
-**风险乘积特征**:`Risk_CD`、`Risk_CR`、`Risk_CDR`(目标编码两两、三三相乘)。
+### 风险乘积特征
 
-**频率编码**:Driver / Race / Compound / Stint 的训练集频率。
+把目标编码两两、三三相乘，生成 `Risk_CD`、`Risk_CR`、`Risk_CDR` 等，用乘积放大高风险组合的信号。
 
-## 模型
+### 频率编码
 
-6 个基模型,算法异构 + 配置差异。统一走 5 种子 × 5 折 StratifiedKFold,种子 `[42, 123, 2024, 456, 789]`,输出 OOF + 测试预测,每模型后 `gc.collect()`,GPU 模型额外 `torch.cuda.empty_cache()`。
+对 Driver、Race、Compound、Stint 计算训练集中的出现频率。稀有车手/赛道的进站规律可能和普遍情况不同，频率编码从样本量维度补充信息，和目标编码互补。
 
-**lgb_deep** — LightGBM,6000 树,lr 0.012,383 叶,深度 11,min_data_in_leaf 25,feature_fraction 0.35,bagging 0.7 每 3 树,L1/L2 = 1.5/2.5,min_gain 0.008,早停 200。主力大容量。
+### 去冗余
 
-**lgb_reg** — LightGBM,5000 树,lr 0.02,127 叶,深度 7,min_data_in_leaf 50,feature_fraction 0.5,bagging 0.8 每 5 树,L1/L2 = 2.0/3.0,min_gain 0.02,早停 200。高正则泛化互补。
+最后会自动删除相关系数 > 0.95 的高相关特征，避免特征冗余对树模型造成干扰。
 
-**xgb_deep** — XGBoost,6000 树,lr 0.012,深度 9,min_child_weight 15,subsample 0.7,colsample_bytree/bylevel 0.35/0.35,L1/L2 = 1.5/2.5,gamma 0.08,早停 300。算法差异化。
+## 模型配置
 
-**xgb_reg** — XGBoost,4000 树,lr 0.02,深度 6,min_child_weight 50,subsample 0.8,colsample_bytree/bylevel 0.5/0.5,L1/L2 = 2.0/3.0,gamma 0.2,早停 200。轻量泛化。
+6 个基模型遵循"算法异构 + 配置差异"的原则，最大化多样性。
 
-**cat_gpu** — CatBoost,Ordered Boosting,Lossguide,4000 迭代,lr 0.02,深度 8,min_data_in_leaf 30,L2 = 5,border_count 128,random_strength 0.5,bagging_temperature 0.5,早停 200 留最优。类别特征原生支持,分裂算法差异大。
+### 统一训练范式
 
-**nn_residual** — PyTorch 残差 MLP,input → 512(Linear+BN+ReLU+Dropout 0.2)→ 2 残差块(每块 2 层 FC+BN+ReLU+Dropout 0.3)→ 下采样 256 → 2 残差块 → 128 → 1(Sigmoid)。AdamW,lr 0.0015,weight_decay 1e-5,ReduceLROnPlateau(patience 5,factor 0.5,min_lr 1e-6),BCELoss,batch 1024/2048,100 epoch,早停 15 轮,折内 StandardScaler。单模比树模型低约 0.005,但错误模式差异最大,集成仍有增益。
+所有模型都走"5 个种子循环 → 单种子 5 折分层交叉验证 → 种子结果平均"的流程，输出 OOF 预测和测试集预测。
+
+- **分层抽样**：`StratifiedKFold` 保证每折正负比例一致
+- **OOF 预测**：验证折完全由未参与训练的折生成，无标签泄露
+- **多种子平均**：5 个种子降低初始化和数据划分的随机性
+- **资源回收**：每个模型训练完执行 `gc.collect()`，GPU 模型额外 `torch.cuda.empty_cache()`
+
+### 6 个模型一览
+
+| 模型 | 算法 | 定位 | 关键参数 |
+|---|---|---|---|
+| lgb_deep | LightGBM | 主力，复杂模式 | 6000 树，lr 0.012，383 叶，深度 11 |
+| lgb_reg | LightGBM | 泛化互补 | 5000 树，lr 0.02，127 叶，深度 7，强正则 |
+| xgb_deep | XGBoost | 算法差异化 | 6000 树，lr 0.012，深度 9，双级列采样 |
+| xgb_reg | XGBoost | 轻量泛化 | 4000 树，lr 0.02，深度 6，高正则 |
+| cat_gpu | CatBoost | 类别特征优化 | 4000 迭代，lr 0.02，深度 8，Ordered Boosting |
+| nn_residual | PyTorch | 深度学习补充 | 4 层残差 MLP，512→256→128→1 |
+
+### 各模型详细参数
+
+#### lgb_deep（LightGBM 深度大容量）
+
+| 参数 | 值 |
+|---|---|
+| 迭代数 | 6000 |
+| 学习率 | 0.012 |
+| 叶子节点数 | 383 |
+| 最大深度 | 11 |
+| 叶子最小样本 | 25 |
+| 特征采样率 | 0.35 |
+| 样本采样率 | 0.7（每 3 树重采样） |
+| L1 / L2 | 1.5 / 2.5 |
+| 分裂最小增益 | 0.008 |
+| 早停 | 200 轮 |
+
+高叶子数 + 低学习率 + 大迭代，容量足够大；低特征采样率增加随机性，压低大容量模型的过拟合风险。
+
+#### lgb_reg（LightGBM 正则泛化）
+
+| 参数 | 值 |
+|---|---|
+| 迭代数 | 5000 |
+| 学习率 | 0.02 |
+| 叶子节点数 | 127 |
+| 最大深度 | 7 |
+| 叶子最小样本 | 50 |
+| 特征采样率 | 0.5 |
+| 样本采样率 | 0.8（每 5 树重采样） |
+| L1 / L2 | 2.0 / 3.0 |
+| 分裂最小增益 | 0.02 |
+| 早停 | 200 轮 |
+
+和 lgb_deep 形成"深度拟合 + 浅层高正则"的互补，避免整个集成偏向过拟合。
+
+#### xgb_deep（XGBoost 深度）
+
+| 参数 | 值 |
+|---|---|
+| 迭代数 | 6000 |
+| 学习率 | 0.012 |
+| 最大深度 | 9 |
+| 叶子最小权重和 | 15 |
+| 行采样 | 0.7 |
+| 列采样（按树 / 按层） | 0.35 / 0.35 |
+| L1 / L2 | 1.5 / 2.5 |
+| 分裂最小损失下降 | 0.08 |
+| 早停 | 300 轮 |
+
+XGBoost 的分裂算法和 LightGBM 本质不同，预测分布有差异，融合后增益明显。两级列采样（按树 + 按层）增强随机性。
+
+#### xgb_reg（XGBoost 浅树正则）
+
+| 参数 | 值 |
+|---|---|
+| 迭代数 | 4000 |
+| 学习率 | 0.02 |
+| 最大深度 | 6 |
+| 叶子最小权重和 | 50 |
+| 行采样 | 0.8 |
+| 列采样（按树 / 按层） | 0.5 / 0.5 |
+| L1 / L2 | 2.0 / 3.0 |
+| 分裂最小损失下降 | 0.2 |
+| 早停 | 200 轮 |
+
+训练最快、资源占用最低，和 lgb_reg 一起拉高集成的泛化底线。
+
+#### cat_gpu（CatBoost）
+
+| 参数 | 值 |
+|---|---|
+| 核心算法 | Ordered Boosting |
+| 树生长策略 | Lossguide |
+| 迭代数 | 4000 |
+| 学习率 | 0.02 |
+| 树深度 | 8 |
+| 叶子最小样本 | 30 |
+| L2 正则 | 5 |
+| 边界分箱数 | 128 |
+| 随机强度 | 0.5 |
+| 贝叶斯采样温度 | 0.5 |
+| 早停 | 200 轮，保留最优模型 |
+
+原生支持类别特征，Ordered Boosting 从原理上减少目标泄露，对高基数类别场景特别合适。分裂算法和另外两类树模型差异大，是集成多样性的重要来源。
+
+#### nn_residual（PyTorch 残差网络）
+
+网络结构：
+
+| 层 | 维度 | 组件 |
+|---|---|---|
+| 输入投影 | input → 512 | Linear + BN + ReLU + Dropout(0.2) |
+| 高维残差组 | 512 → 512 | 2 个残差块（每个 2 层 FC + BN + ReLU + Dropout(0.3)） |
+| 下采样 | 512 → 256 | Linear + BN + ReLU + Dropout(0.3) |
+| 低维残差组 | 256 → 256 | 2 个残差块 |
+| 输出 | 256 → 128 → 1 | Linear + BN + ReLU + Dropout(0.3) + Linear + Sigmoid |
+
+训练配置：
+
+| 配置 | 值 |
+|---|---|
+| 训练批次 | 1024 |
+| 验证批次 | 2048 |
+| 损失 | BCELoss |
+| 优化器 | AdamW |
+| 学习率 | 0.0015 |
+| 权重衰减 | 1e-5 |
+| 学习率调度 | ReduceLROnPlateau，5 轮不降则减半，最低 1e-6 |
+| 最大 epoch | 100 |
+| 早停 | 15 轮验证 AUC 无提升 |
+| 标准化 | 折内 StandardScaler（只用训练折拟合） |
+
+NN 单模 AUC 通常比树模型低 0.005 左右，但加进集成后仍有 0.001+ 的提升，所以保留。残差结构解决深层梯度消失，BatchNorm 加速收敛，多层 Dropout 防过拟合。和树模型错误模式差异最大，是集成增益的来源。
 
 ## 集成策略
 
-三级结构:线性权重优化 + 二层堆叠 + 最终融合。
+集成模块采用"线性权重优化 + 二层堆叠 + 最终融合"三级结构。
 
-先算 6 模型 OOF 两两皮尔逊相关,相关性越低融合增益越高。
+### 模型相关性分析
 
-**第一层 L-BFGS-B 权重优化**:目标最小化负验证 AUC,约束权重非负且和为 1,20 次狄利克雷采样初始值迭代避免局部最优。
+算 6 个模型 OOF 预测两两的皮尔逊相关系数。相关性越低，模型错误模式差异越大，融合增益越高。如果所有模型相关性都极高，说明同质化严重，继续集成收益有限。
 
-**第二层 5 折交叉堆叠**:6 模型 OOF 作 6 列新特征,三个元模型并行——Ridge α=100、Ridge α=500、LogisticRegression C=0.1,折内训练,取验证 AUC 最高的输出。试过 LightGBM 元模型,线上线下 gap 变大,退回 Ridge。
+### 第一层：L-BFGS-B 权重优化
 
-**最终融合**:权重优化结果与最优堆叠结果等权平均,平滑波动。
+用 SciPy 的 L-BFGS-B 做有约束优化：
 
-## 输出
+- 目标：最小化负验证 AUC（等价于最大化 AUC）
+- 约束：权重非负，和为 1
+- 20 次随机初始值迭代，每次从狄利克雷分布采样，避免局部最优
 
-- `submission_v8_gpu.csv` — 提交文件
-- `experiment_v8_gpu.json` — `models`(单模 AUC)、`optimized_auc`、`ridge_auc`、`final_auc`、`method`、`n_features`、`elapsed_s`
-- `oof_*.npy` — 6 模型 OOF
-- `test_*.npy` — 6 模型测试预测
+相比简单平均能自动给效果好、差异大的模型更高权重；相比网格搜索收敛快、稳定。
 
-预测裁剪到 `[0.001, 0.999]`,控制台打印单模 AUC / 集成 AUC / 最终方法 / 总耗时。
+### 第二层：5 折交叉堆叠
 
-## 模型效果
+把 6 个模型的 OOF 预测作为新特征（6 列），5 折分层交叉训练元模型：
 
-- lgb_deep: —   - lgb_deep: &mdash；
-- lgb_reg: —   - lgb_reg: &mdash；
-- xgb_deep: —   - xgb_deep: —
-- xgb_reg: —   - xgb_reg: —
-- cat_gpu: —   - cat_gpu: &mdash；
-- nn_residual: —
-- 权重优化集成: —
-- 堆叠集成: —
-- 最终融合: —
-- Kaggle 线上: —(目标 LB > 0.954)
+| 元模型 | 参数 | 定位 |
+|---|---|---|
+| Ridge | alpha=100 | 中等正则线性 |
+| Ridge | alpha=500 | 强正则线性 |
+| LogisticRegression | C=0.1 | 带 sigmoid 的非线性 |
 
-## 常见坑
+严格折内训练，元模型完全看不到验证折标签。三个元模型并行对比，取验证 AUC 最高的作为堆叠输出。
 
-**`FileNotFoundError: 'train.csv'`** — 数据放 `playground-series-s6e5/` 或改代码路径。
+试过用 LightGBM 做元模型，但线上线下分数差变大，最终退回 Ridge。
 
-**`ValueError: Expected 2D array, got 1D`** — 堆叠循环变量名与全局 `oof_stack` 重名,二维被一维覆盖。
+### 最终融合
 
-**GPU 没识别** — 装 CUDA 版 PyTorch,确认 `torch.cuda.is_available()`。LightGBM 4.0+ 用 `device='cuda'`。
+把"权重优化结果"和"最优堆叠结果"等权平均。两种方法原理不同、错误模式不同，简单平均能平滑波动，降低线上线下分数差异的风险。
 
-**线下高线上低** — 查目标编码、时序特征泄露,验证折划分,加正则。
+## 输出文件
 
-**模型相关性高** — 加差异化模型,拉开参数差异,或新特征维度。
+运行结束后当前目录生成 4 类文件：
 
-**NN 弱于树模型** — 表格数据正常,NN 价值在差异化预测。
+| 文件 | 格式 | 说明 |
+|---|---|---|
+| `submission_v8_gpu.csv` | CSV | 最终提交文件，格式与官方样例一致 |
+| `experiment_v8_gpu.json` | JSON | 实验记录（各单模 AUC、集成分数、特征数、耗时） |
+| `oof_*.npy` | numpy | 6 个模型的 OOF 验证预测，可用于后续集成实验 |
+| `test_*.npy` | numpy | 6 个模型的测试集预测，可直接加载做二次融合 |
+
+预测值最终裁剪到 `[0.001, 0.999]`，避免极端概率影响 AUC 排序。控制台会打印完整结果报表（单模 AUC、集成 AUC、最终方法、总耗时）。
+
+`experiment_v8_gpu.json` 字段：
+
+| 字段 | 说明 |
+|---|---|
+| models | 各单模型验证 AUC |
+| optimized_auc | 权重优化后集成 AUC |
+| ridge_auc | 最优堆叠 AUC |
+| final_auc | 最终融合 AUC |
+| method | 最终采用的融合方法 |
+| n_features | 使用特征数 |
+| elapsed_s | 总耗时（秒） |
+
+## 常见问题
+
+### 运行报错
+
+**eg. `FileNotFoundError: No such file or directory: 'train.csv'`**
+数据路径不对。把数据放进 `playground-series-s6e5/` 目录，或修改代码中的路径。
+
+**eg. `ValueError: Expected 2D array, got 1D array instead`**
+堆叠部分的循环变量名和全局 `oof_stack` 重名，二维矩阵被一维数组覆盖。检查变量命名。
+
+**eg. GPU 没识别，跑在 CPU 上**
+CUDA 环境没配好，或装的是 CPU 版 PyTorch。装对应 CUDA 版本的 PyTorch，确认 `torch.cuda.is_available()` 返回 True。LightGBM 4.0+ 的 GPU 参数从 `device='gpu'` 改成了 `device='cuda'`，注意版本差异。
+
+### 效果调优
+
+**eg. 线下 AUC 高，线上分数低**
+大概率是数据泄露或过拟合。检查目标编码、时序特征有没有泄露，验证折划分是否合理，适当加大正则。
+
+**eg.模型间相关性都很高，集成增益小**
+增加差异化模型，拉开参数差异，或新增特征工程维度引入新信息源。
+
+**eg. 神经网络明显弱于树模型**
+正常。表格数据树模型通常是基线最优，NN 的价值在提供差异化预测，不是单模精度。
 
 ## 调参方向
 
-**全局**:`SEEDS` 5 个,金牌区建议 5–10;`NF` 5,10 折更准但耗时翻倍。
+### 全局超参
 
-**树模型**:榨精度加迭代降学习率,同步加早停;压过拟合加 L1/L2、`min_child_weight`/`min_data_in_leaf`、降特征采样;压方差加 bagging 频率。
+| 参数 | 默认 | 调整建议 |
+|---|---|---|
+| SEEDS | 5 个种子 | 增加种子提升稳定性，但耗时线性增长 |
+| NF | 5 折 | 折数多偏差小，方差大；折数少反之 |
+| gm | 0.1990 | 取训练集标签均值即可，不要手调 |
 
-**神经网络**:lr 0.001–0.003 最敏感;Dropout 0.2–0.4;残差块加减看显存。
+### 树模型
 
-**集成**:元模型试 LR / Ridge 不同 α;权重优化初始值迭代可加但收益递减;拉多样性可加 sklearn GradientBoosting(慢)。
+- **过拟合**：降 `num_leaves` / `max_depth`，提 `min_data_in_leaf`，加 L1/L2
+- **欠拟合**：提 `n_estimators`，降 `learning_rate`，提 `feature_fraction`
+- **训练慢**：降 `n_estimators`、提 `learning_rate`，或减少种子数
+
+### 神经网络
+
+- **不收敛**：降学习率，检查标签是否正确，标准化是否只在训练折拟合
+- **过拟合**：加 Dropout，减层，加权重衰减
+- **欠拟合**：加层、加宽，降 Dropout
+
+### 集成
+
+- **增益不明显**：检查模型相关性，相关性太高就换差异化更大的模型
+- **线上线下差大**：堆叠元模型用更强正则，或退回简单平均
 
 ## License
 
-仓库内容仅供学习交流,遵循 Kaggle Playground Series 赛事规则。
+仅用于学习和 Kaggle 比赛提交。
