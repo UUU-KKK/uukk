@@ -544,8 +544,3 @@ CUDA 环境没配好，或装的是 CPU 版 PyTorch。装对应 CUDA 版本的 P
 - 元模型：可加 SVM、浅层 LightGBM 等
 - 最终融合权重：默认等权，可按线下验证调整比例
 
----
-
-## License
-
-本项目仅供学习交流，数据版权归 Kaggle Playground Series S6E5 赛事方所有。
